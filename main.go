@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 // sourceMap represents a sourceMap. We only really care about the sources and
@@ -29,15 +31,40 @@ type sourceMap struct {
 
 // command line args
 type config struct {
-	outdir   string     // output directory
-	url      string     // sourcemap url
-	jsurl    string     // javascript url
-	proxy    string     // upstream proxy server
-	insecure bool       // skip tls verification
-	headers  headerList // additional user-supplied http headers
+	outdir      string     // output directory
+	url         string     // sourcemap url
+	list        string     // filepath to list of sourcemap urls
+	jsurl       string     // javascript url
+	proxy       string     // upstream proxy server
+	insecure    bool       // skip tls verification
+	headers     headerList // additional user-supplied http headers
+	concurrency int        // number of concurrent requests to make
+	verbose     bool       // verbose output
 }
 
 type headerList []string
+
+func outputHandler(text string, outputType string, verbose bool) {
+
+	if !verbose && outputType != "err" {
+		return
+	}
+
+	cRed := "\033[31m"
+	cGreen := "\033[32m"
+	cYellow := "\033[33m"
+
+	switch outputType {
+	case "info":
+		log.Printf("%s[+] %s%s\n", cGreen, text, "\033[0m")
+	case "warn":
+		log.Printf("%s[!] %s%s\n", cYellow, text, "\033[0m")
+	case "err":
+		log.Fatalf("%s[!] %s%s\n", cRed, text, "\033[0m")
+	default:
+		log.Printf("%s[+] %s%s\n", cGreen, text, "\033[0m")
+	}
+}
 
 func (i *headerList) String() string {
 	return ""
@@ -50,11 +77,13 @@ func (i *headerList) Set(value string) error {
 
 // getSourceMap retrieves a sourcemap from a URL or a local file and returns
 // its sourceMap.
-func getSourceMap(source string, headers []string, insecureTLS bool, proxyURL url.URL) (m sourceMap, err error) {
+func getSourceMap(source string, headers []string, insecureTLS bool, proxyURL url.URL, verbose *bool) (m sourceMap, err error) {
 	var body []byte
 	var client http.Client
 
-	log.Printf("[+] Retrieving Sourcemap from %.1024s...\n", source)
+	outputHandler(fmt.Sprintf("Processing Sourcemap from %.1024s", source), "info", true)
+
+	outputHandler(fmt.Sprintf("Retrieving Sourcemap from %.1024s\n", source), "info", *verbose)
 
 	u, err := url.ParseRequestURI(source)
 	if err != nil {
@@ -87,7 +116,8 @@ func getSourceMap(source string, headers []string, insecureTLS bool, proxyURL ur
 
 			if len(headers) > 0 {
 				headerString := strings.Join(headers, "\r\n") + "\r\n\r\n" // squish all the headers together with CRLFs
-				log.Printf("[+] Setting the following headers: \n%s", headerString)
+
+				outputHandler(fmt.Sprintf("Setting the following headers: \n%s", headerString), "info", *verbose)
 
 				r := bufio.NewReader(strings.NewReader(headerString))
 				tpReader := textproto.NewReader(r)
@@ -110,22 +140,22 @@ func getSourceMap(source string, headers []string, insecureTLS bool, proxyURL ur
 			defer res.Body.Close()
 
 			if res.StatusCode != 200 && len(body) > 0 {
-				log.Printf("[!] WARNING - non-200 status code: %d - Confirm this URL contains valid source map manually!", res.StatusCode)
-				log.Printf("[!] WARNING - sourceMap URL request return != 200 - however, body length > 0 so continuing... ")
+				outputHandler(fmt.Sprintf("non-200 status code: %d - Confirm this URL contains valid source map manually!", res.StatusCode), "warn", *verbose)
+				outputHandler("sourceMap URL request return != 200 - however, body length > 0 so continuing...", "warn", *verbose)
 			}
 
 			if err != nil {
-				log.Fatalln(err)
+				outputHandler(fmt.Sprintf("Error reading response body: %s", err), "err", *verbose)
 			}
 		} else if u.Scheme == "data" {
 			urlchunks := strings.Split(u.Opaque, ",")
 			if len(urlchunks) < 2 {
-				log.Fatalf("[!] Could not parse data URI - expected atleast 2 chunks but got %d\n", len(urlchunks))
+				outputHandler(fmt.Sprintf("Could not parse data URI - expected atleast 2 chunks but got %d\n", len(urlchunks)), "err", *verbose)
 			}
 
 			data, err := base64.StdEncoding.DecodeString(urlchunks[1])
 			if err != nil {
-				log.Fatal("[!] Error base64 decoding", err)
+				outputHandler(fmt.Sprintf("Error base64 decoding: %s", err), "err", *verbose)
 			}
 
 			body = []byte(data)
@@ -138,11 +168,11 @@ func getSourceMap(source string, headers []string, insecureTLS bool, proxyURL ur
 		}
 	}
 	// Unmarshall the body into the struct.
-	log.Printf("[+] Read %d bytes, parsing JSON.\n", len(body))
+	outputHandler(fmt.Sprintf("Read %d bytes, parsing JSON.", len(body)), "info", *verbose)
 	err = json.Unmarshal(body, &m)
 
 	if err != nil {
-		log.Printf("[!] Error parsing JSON - confirm %s is a valid JS sourcemap", source)
+		outputHandler("Error parsing JSON - confirm this is a valid JS sourcemap", "warning", *verbose)
 	}
 
 	return
@@ -150,10 +180,12 @@ func getSourceMap(source string, headers []string, insecureTLS bool, proxyURL ur
 
 // getSourceMapFromJS queries a JavaScript URL, parses its headers and content and looks for sourcemaps
 // follows the rules outlined in https://tc39.es/source-map-spec/#linking-generated-code
-func getSourceMapFromJS(jsurl string, headers []string, insecureTLS bool, proxyURL url.URL) (m sourceMap, err error) {
+func getSourceMapFromJS(jsurl string, headers []string, insecureTLS bool, proxyURL url.URL, verbose *bool) (m sourceMap, err error) {
 	var client http.Client
 
-	log.Printf("[+] Retrieving JavaScript from URL: %s.\n", jsurl)
+	outputHandler(fmt.Sprintf("Processing JavaScript from URL: %.1024s", jsurl), "info", true)
+
+	outputHandler(fmt.Sprintf("Retrieving JavaScript from URL: %s", jsurl), "info", *verbose)
 
 	// perform the request
 	u, err := url.ParseRequestURI(jsurl)
@@ -182,7 +214,7 @@ func getSourceMapFromJS(jsurl string, headers []string, insecureTLS bool, proxyU
 
 	if len(headers) > 0 {
 		headerString := strings.Join(headers, "\r\n") + "\r\n\r\n" // squish all the headers together with CRLFs
-		log.Printf("[+] Setting the following headers: \n%s", headerString)
+		outputHandler(fmt.Sprintf("Setting the following headers: \n%s", headerString), "info", *verbose)
 
 		r := bufio.NewReader(strings.NewReader(headerString))
 		tpReader := textproto.NewReader(r)
@@ -202,7 +234,7 @@ func getSourceMapFromJS(jsurl string, headers []string, insecureTLS bool, proxyU
 	}
 
 	if res.StatusCode != 200 {
-		log.Fatalf("[!] non-200 status code: %d", res.StatusCode)
+		outputHandler(fmt.Sprintf("non-200 status code: %d - Confirm this URL contains valid source map manually!", res.StatusCode), "warn", *verbose)
 	}
 
 	var sourceMap string
@@ -213,7 +245,7 @@ func getSourceMapFromJS(jsurl string, headers []string, insecureTLS bool, proxyU
 	}
 
 	if sourceMap != "" {
-		log.Printf("[.] Found SourceMap URI in response headers: %.1024s...", sourceMap)
+		outputHandler(fmt.Sprintf("Found SourceMap URI in response headers: %s", sourceMap), "info", *verbose)
 	} else {
 		// parse the javascript
 		body, err := io.ReadAll(res.Body)
@@ -229,7 +261,7 @@ func getSourceMapFromJS(jsurl string, headers []string, insecureTLS bool, proxyU
 		if len(match) != 0 {
 			// only the sourcemap at the end of the file should be valid
 			sourceMap = string(match[len(match)-1][1])
-			log.Printf("[.] Found SourceMap in JavaScript body: %.1024s...", sourceMap)
+			outputHandler(fmt.Sprintf("Found SourceMap in JavaScript body: %s", sourceMap), "info", *verbose)
 		}
 	}
 
@@ -247,15 +279,15 @@ func getSourceMapFromJS(jsurl string, headers []string, insecureTLS bool, proxyU
 			}
 		}
 
-		return getSourceMap(sourceMapURL.String(), headers, insecureTLS, proxyURL)
+		return getSourceMap(sourceMapURL.String(), headers, insecureTLS, proxyURL, verbose)
 	}
 
-	err = errors.New("[!] No sourcemap URL found")
+	err = errors.New("no sourcemap url found")
 	return
 }
 
 // writeFile writes content to file at path p.
-func writeFile(p string, content string) error {
+func writeFile(p string, content string, verbose *bool) error {
 	p = filepath.Clean(p)
 
 	if _, err := os.Stat(filepath.Dir(p)); os.IsNotExist(err) {
@@ -267,7 +299,7 @@ func writeFile(p string, content string) error {
 		}
 	}
 
-	log.Printf("[+] Writing %d bytes to %s.\n", len(content), p)
+	outputHandler(fmt.Sprintf("Writing %d bytes to %s.", len(content), p), "info", *verbose)
 	return os.WriteFile(p, []byte(content), 0600)
 }
 
@@ -277,65 +309,19 @@ func cleanWindows(p string) string {
 	return m1.ReplaceAllString(p, "")
 }
 
-func main() {
-	var proxyURL url.URL
-	var conf config
-	var err error
-
-	flag.StringVar(&conf.outdir, "output", "", "Source file output directory - REQUIRED")
-	flag.StringVar(&conf.url, "url", "", "URL or path to the Sourcemap file - cannot be used with jsurl")
-	flag.StringVar(&conf.jsurl, "jsurl", "", "URL to JavaScript file - cannot be used with url")
-	flag.StringVar(&conf.proxy, "proxy", "", "Proxy URL")
-	help := flag.Bool("help", false, "Show help")
-	flag.BoolVar(&conf.insecure, "insecure", false, "Ignore invalid TLS certificates")
-	flag.Var(&conf.headers, "header", "A header to send with the request, similar to curl's -H. Can be set multiple times, EG: \"./sourcemapper --header \"Cookie: session=bar\" --header \"Authorization: blerp\"")
-	flag.Parse()
-
-	if *help || (conf.url == "" && conf.jsurl == "") || conf.outdir == "" {
-		flag.Usage()
-		return
-	}
-
-	if conf.jsurl != "" && conf.url != "" {
-		log.Println("[!] Both -jsurl and -url supplied")
-		flag.Usage()
-		return
-	}
-
-	if conf.proxy != "" {
-		p, err := url.Parse(conf.proxy)
-		if err != nil {
-			log.Fatal(err)
-		}
-		proxyURL = *p
-	}
-
-	var sm sourceMap
-
-	// these need to just take the conf object
-	if conf.url != "" {
-		if sm, err = getSourceMap(conf.url, conf.headers, conf.insecure, proxyURL); err != nil {
-			log.Fatal(err)
-		}
-	} else if conf.jsurl != "" {
-		if sm, err = getSourceMapFromJS(conf.jsurl, conf.headers, conf.insecure, proxyURL); err != nil {
-			log.Fatal(err)
-		}
-	}
-
-	// everything below needs to go into its own function
-	log.Printf("[+] Retrieved Sourcemap with version %d, containing %d entries.\n", sm.Version, len(sm.Sources))
+func postProcess(sm *sourceMap, conf *config) {
+	outputHandler(fmt.Sprintf("Retrieved Sourcemap with version %d, containing %d entries.", sm.Version, len(sm.Sources)), "info", conf.verbose)
 
 	if len(sm.Sources) == 0 {
-		log.Fatal("No sources found.")
+		outputHandler("No sources found.", "err", conf.verbose)
 	}
 
 	if len(sm.SourcesContent) == 0 {
-		log.Fatal("No source content found.")
+		outputHandler("No source content found.", "err", conf.verbose)
 	}
 
-	if sm.Version != 3 {
-		log.Println("[!] Sourcemap is not version 3. This is untested!")
+	if sm.Version != 3 && conf.verbose {
+		outputHandler(fmt.Sprintf("Sourcemap version is %d, expected 3.", sm.Version), "warn", conf.verbose)
 	}
 
 	if _, err := os.Stat(conf.outdir); os.IsNotExist(err) {
@@ -354,11 +340,94 @@ func main() {
 
 		// Use filepath.Join. https://parsiya.net/blog/2019-03-09-path.join-considered-harmful/
 		scriptPath, scriptData := filepath.Join(conf.outdir, filepath.Clean(sourcePath)), sm.SourcesContent[i]
-		err := writeFile(scriptPath, scriptData)
-		if err != nil {
-			log.Printf("Error writing %s file: %s", scriptPath, err)
+		err := writeFile(scriptPath, scriptData, &conf.verbose)
+		if err != nil && conf.verbose {
+			outputHandler(fmt.Sprintf("Error writing %s: %s", scriptPath, err), "warn", conf.verbose)
 		}
 	}
 
-	log.Println("[+] Done")
+	outputHandler(fmt.Sprintf("Successfully wrote %d files to %s", len(sm.Sources), conf.outdir), "info", conf.verbose)
+}
+
+func main() {
+	var proxyURL url.URL
+	var conf config
+
+	flag.StringVar(&conf.outdir, "output", "", "Source file output directory - REQUIRED")
+	flag.StringVar(&conf.url, "url", "", "URL or path to the Sourcemap file - cannot be used with jsurl")
+	flag.StringVar(&conf.jsurl, "jsurl", "", "URL to JavaScript file - cannot be used with url")
+	flag.StringVar(&conf.list, "list", "", "File containing a list of Sourcemap URLs")
+	flag.StringVar(&conf.proxy, "proxy", "", "Proxy URL")
+	help := flag.Bool("help", false, "Show help")
+	flag.BoolVar(&conf.insecure, "insecure", false, "Ignore invalid TLS certificates")
+	flag.Var(&conf.headers, "header", "A header to send with the request, similar to curl's -H. Can be set multiple times, EG: \"./sourcemapper --header \"Cookie: session=bar\" --header \"Authorization: blerp\"")
+	flag.IntVar(&conf.concurrency, "c", 10, "Number of concurrent requests to make")
+	flag.BoolVar(&conf.verbose, "v", false, "Verbose output")
+	flag.Parse()
+
+	if *help || (conf.url == "" && conf.jsurl == "" && conf.list == "") || conf.outdir == "" {
+		flag.Usage()
+		return
+	}
+
+	if (conf.url == "") != (conf.jsurl == "") != (conf.list == "") {
+		outputHandler("Multiple input options specified!", "warn", conf.verbose)
+		flag.Usage()
+		return
+	}
+
+	if conf.proxy != "" {
+		p, err := url.Parse(conf.proxy)
+		if err != nil {
+			log.Fatal(err)
+		}
+		proxyURL = *p
+	}
+
+	// these need to just take the conf object
+	if conf.url != "" {
+		sm, err := getSourceMap(conf.url, conf.headers, conf.insecure, proxyURL, &conf.verbose)
+		if err != nil {
+			log.Fatal(err)
+		}
+		postProcess(&sm, &conf)
+	} else if conf.jsurl != "" {
+		sm, err := getSourceMapFromJS(conf.jsurl, conf.headers, conf.insecure, proxyURL, &conf.verbose)
+		if err != nil {
+			log.Fatal(err)
+		}
+		postProcess(&sm, &conf)
+	} else if conf.list != "" {
+		// read the file
+		file, err := os.Open(conf.list)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer file.Close()
+
+		jobs := make(chan string)
+
+		// start a worker pool of workers to process the jobs
+		var wg sync.WaitGroup
+		for i := 0; i < conf.concurrency; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for job := range jobs {
+					sm, err := getSourceMap(job, conf.headers, conf.insecure, proxyURL, &conf.verbose)
+					if err != nil {
+						outputHandler(fmt.Sprintf("Error retrieving sourcemap: %s", err), "warn", true)
+						continue
+					}
+					postProcess(&sm, &conf)
+				}
+			}()
+		}
+
+		// assign jobs to the workers
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			jobs <- scanner.Text()
+		}
+	}
 }

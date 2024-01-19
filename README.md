@@ -26,20 +26,25 @@ go build
 ```None
 :~$ ./sourcemapper
 Usage of ./sourcemapper:
+  -c int
+        Number of concurrent requests to make (default 10)
   -header value
-    	A header to send with the request, similar to curl's -H. Can be set multiple times, EG: "./sourcemapper --header "Cookie: session=bar" --header "Authorization: blerp"
+        A header to send with the request, similar to curl's -H. Can be set multiple times, EG: "./sourcemapper --header "Cookie: session=bar" --header "Authorization: blerp"
   -help
-    	Show help
+        Show help
   -insecure
-    	Ignore invalid TLS certificates
+        Ignore invalid TLS certificates
   -jsurl string
-    	URL to JavaScript file - cannot be used with url
+        URL to JavaScript file - cannot be used with url
+  -list string
+        File containing a list of Sourcemap URLs
   -output string
-    	Source file output directory - REQUIRED
+        Source file output directory - REQUIRED
   -proxy string
-    	Proxy URL
+        Proxy URL
   -url string
-    	URL or path to the Sourcemap file - cannot be used with jsurl
+        URL or path to the Sourcemap file - cannot be used with jsurl
+  -v    Verbose output
 ```
 
 ## Extracting SourceMaps from .map URLs or local files
